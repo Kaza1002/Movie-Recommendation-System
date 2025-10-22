@@ -1,0 +1,60 @@
+---
+title: "EDA Part-1"
+output: html_document
+date: "2025-10-17"
+---
+**Goal:** Perform EDA Part 1 — explore movie dataset through genre frequency, rating distribution, and identify trends or outliers to guide deeper analysis.
+
+
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse); library(data.table); library(tidyr); library(GGally)
+merged <- fread("data/merged_data_final.csv")
+```
+
+```{r}
+cat("Total unique movies:", n_distinct(merged$movieId), "\n")
+if ("userId" %in% names(merged)) cat("Total unique users:", n_distinct(merged$userId), "\n")
+
+```
+
+### Genre bar chart
+
+```{r fig.width=7, fig.height=5}
+merged %>%
+  separate_rows(genres, sep=" +") %>%
+  filter(genres != "") %>%
+  count(genres, sort=TRUE) %>%
+  slice_head(n=20) %>%
+  ggplot(aes(x=reorder(genres, n), y=n)) + geom_col() + coord_flip() +
+  labs(title="Top Genres", x="Genre", y="Count")
+```
+
+
+### Ratings hist (if ratings present via avg_rating)
+
+```{r}
+if ("avg_rating" %in% names(merged)) {
+  merged %>% ggplot(aes(avg_rating)) + geom_histogram(bins=30) +
+    labs(title="Avg Rating per Movie", x="Avg Rating", y="Count")
+}
+```
+
+```{r}
+if (all(c("avg_rating", "rating_count") %in% names(merged))) {
+merged %>%
+select(avg_rating, rating_count) %>%
+GGally::ggpairs(title = "Pairwise Relationship: Avg Rating vs Rating Count")
+}
+
+```
+
+```{r}
+if ("rating_count" %in% names(merged)) {
+ggplot(merged, aes(y=rating_count)) +
+geom_boxplot(fill="orange", outlier.color="red", outlier.shape=8) +
+labs(title="Boxplot: Rating Count (Outlier Check)", y="Rating Count")
+}
+
+```
+

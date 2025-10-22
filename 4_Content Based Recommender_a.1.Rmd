@@ -1,0 +1,153 @@
+---
+title: "4_Content Based Recommender_2"
+output: html_document
+date: "2025-10-18"
+---
+**Goal:** Content-based model — TF-IDF on `genres + all_tags`, cosine similarity, helper function, sample recommendations
+
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse); library(data.table); library(tm); library(SnowballC); library(stringr)
+merged <- fread("data/merged_data_final.csv")
+merged$text_blob <- str_squish(paste(merged$genres, merged$all_tags))
+```
+
+
+### TF-IDF + cosine
+
+```{r}
+### TF-IDF + cosine (robust, UTF-8 safe, memory light)
+
+suppressPackageStartupMessages({
+  library(stringi)
+  library(tm)
+  library(slam)
+  library(dplyr)
+  library(stringr)
+})
+
+# 0) Make sure the fields exist and are character
+if (!"genres"   %in% names(merged)) merged$genres   <- ""
+if (!"all_tags" %in% names(merged)) merged$all_tags <- ""
+merged$genres   <- ifelse(is.na(merged$genres),   "", as.character(merged$genres))
+merged$all_tags <- ifelse(is.na(merged$all_tags), "", as.character(merged$all_tags))
+
+# 1) Clean & normalize encoding BEFORE corpus
+txt <- str_squish(paste(merged$genres, merged$all_tags))
+txt <- stri_replace_all_regex(txt, "\\p{C}+", " ")              # drop control bytes
+txt <- stri_trans_general(txt, "Any-Latin; Latin-ASCII")        # transliterate accents
+txt <- iconv(txt, from = "", to = "UTF-8", sub = "")            # force UTF-8; drop bad bytes
+
+keep <- !is.na(txt) & nzchar(txt)
+txt <- txt[keep]
+merged2 <- merged[keep, ]
+
+# 2) Build corpus and DTM with tf-idf
+corpus <- VCorpus(VectorSource(txt)) |>
+  tm_map(content_transformer(tolower)) |>
+  tm_map(removePunctuation) |>
+  tm_map(removeNumbers) |>
+  tm_map(removeWords, stopwords("english")) |>
+  tm_map(stripWhitespace)
+
+dtm <- DocumentTermMatrix(corpus, control = list(weighting = weightTfIdf))
+dtm <- removeSparseTerms(dtm, 0.995)  # relax to 0.998 if needed to save RAM
+
+# 3) Row-normalize tf-idf ONCE (cosine needs unit-length rows)
+#    (stay sparse; avoid dense matrices)
+row_norms <- sqrt(row_sums(dtm ^ 2)) + 1e-12
+dtm_norm  <- dtm
+dtm_norm$v <- dtm_norm$v / row_norms[dtm_norm$i]
+
+# 4) Index map after any filtering
+idx_map <- merged2 |>
+  mutate(row_id = seq_len(nrow(merged2))) |>
+  select(row_id, movieId, title, year, genres)
+
+# 5) Fast per-query cosine: one row vs all rows (no full N×N)
+recommend_by_title <- function(q, k = 10) {
+  hits <- idx_map |> filter(str_detect(tolower(title), tolower(q))) |> pull(row_id)
+  if (!length(hits)) return(tibble(note = "No match"))
+  r <- hits[1]
+  # similarity vector: <r, all> since rows are unit-length
+  s <- as.numeric(dtm_norm[r, ] %*% t(dtm_norm))
+  s[r] <- 0
+  ord <- order(s, decreasing = TRUE)
+  out <- idx_map[ord, , drop = FALSE] |>
+    mutate(similarity = s[ord]) |>
+    slice_head(n = k)
+  out
+}
+
+# Example
+recommend_by_title("Toy Story", 10)
+```
+
+```{r similarity-plot, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+library(ggplot2)
+seed_title <- "Toy Story"   # change as you like
+
+rec <- recommend_by_title(seed_title, k = 20)
+stopifnot(!is.null(rec), nrow(rec) > 0)
+
+top10 <- rec %>% slice_head(n = 10)
+
+ggplot(top10, aes(x = reorder(title, similarity), y = similarity)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = paste("Top 10 similar to:", seed_title),
+       x = "Movie Title", y = "Cosine Similarity") +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+### 2) Runtime + lightweight memory stats
+```{r runtime-and-memory, message=FALSE}
+# Timing a single query (includes vector-matrix multiply and sort)
+seed_title <- "Toy Story"
+tim <- system.time({
+  tmp <- recommend_by_title(seed_title, k = 50)
+})
+print(tim)  # user, system, elapsed
+
+# DTM size / sparsity (no heavy packages needed)
+n_docs  <- nrow(dtm)
+n_terms <- ncol(dtm)
+nnz     <- length(dtm$v)                          # non-zeros
+sparsity <- 1 - (nnz / (n_docs * n_terms))
+
+# Rough RAM estimate of sparse triplet (i, j, v): 4 + 4 + 8 bytes per entry
+approx_bytes <- nnz * (4 + 4 + 8)
+fmt_mb <- function(b) sprintf("%.1f MB", b / (1024^2))
+
+cat(
+  "DTM:", n_docs, "docs |", n_terms, "terms\n",
+  "Non-zeros:", format(nnz, big.mark=","), "\n",
+  "Sparsity:", sprintf("%.4f", sparsity), "\n",
+  "Approx sparse storage:", fmt_mb(approx_bytes), "\n"
+)
+```
+
+
+---
+
+### 3) TF-IDF parameter tuning knobs (min/max document frequency)
+
+```{r tfidf-tuning, message=FALSE}
+# Example knobs (adjust per corpus size)
+minDocFreq <- 5        # keep terms that appear in at least 5 documents
+maxDocProp <- 0.50     # ...but not in more than 50% of documents
+
+df <- slam::col_sums(dtm > 0)            # document frequency per term
+keep <- which(df >= minDocFreq & df <= maxDocProp * nrow(dtm))
+dtm  <- dtm[, keep, drop = FALSE]
+
+# If memory is tight, you can also relax sparsity pruning:
+# dtm <- removeSparseTerms(dtm, 0.998)  # was 0.995
+```
+
+
+
+### Higher `minDocFreq` removes ultra-rare noise; lower `maxDocProp` removes near-stopwords. 
+### Rebuild `row_norms`, `dtm_norm`, and keep your `idx_map` the same after filtering.

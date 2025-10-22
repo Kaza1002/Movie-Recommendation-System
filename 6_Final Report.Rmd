@@ -1,0 +1,126 @@
+---
+title: "Final Report"
+output: html_document
+date: "2025-10-18"
+---
+**Goal:** “glue” report — load outputs from both models, show recommendations, tables/plots, and a simple **single place** to run
+
+
+---
+title: "Final Report"
+output: html_document
+date: "2025-10-18"
+---
+
+**Goal:** Load outputs from both models, show recommendations, runtime header, and a combined performance comparison (Content vs IBCF).
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse); library(data.table); library(stringr)
+library(tm); library(slam)   # used only if DTM fallback is needed
+theme_set(theme_minimal())
+
+# --- core data ---
+merged <- fread("data/merged_data_final.csv")
+
+# (optional) one-hot features if you saved them earlier
+onehot <- if (file.exists("data/cleaned_data(onehot).csv"))
+  fread("data/cleaned_data(onehot).csv") else NULL
+
+# --- optional model artifacts ---
+sim  <- if (file.exists("data/content_similarity.rds"))
+  readRDS("data/content_similarity.rds") else NULL
+
+art  <- if (file.exists("artifacts/content_dtm_model.rds"))
+  readRDS("artifacts/content_dtm_model.rds") else NULL
+
+ibcf <- if (file.exists("models/ibcf_model.rds"))
+  readRDS("models/ibcf_model.rds") else NULL   # your lightweight IBCF list(similarity=..., item_labels=...)
+
+# --- row index map (must align with sim or dtm if present) ---
+idx_map <- merged %>%
+  mutate(row_id = row_number()) %>%
+  select(row_id, movieId, title, year, genres)
+
+# If DTM artifacts exist, expose them
+if (!is.null(art)) {
+  dtm <- art$dtm
+  row_norms <- art$row_norms
+  stopifnot(nrow(dtm) == nrow(idx_map))  # ensure alignment
+}
+
+# -------- Sparse 1×N cosine (used only when dtm/row_norms exist) --------
+cosine_row <- function(r_idx) {
+  sims <- as.numeric(slam::tcrossprod_simple_triplet_matrix(dtm[r_idx, ], dtm))
+  sims[r_idx] <- 0
+  denom <- (row_norms[r_idx] * row_norms) + 1e-12
+  sims / denom
+}
+
+# -------- Unified recommender: uses precomputed sim if available; else DTM fallback --------
+recommend_by_title <- function(q, k = 10) {
+  hits <- idx_map %>%
+    filter(str_detect(tolower(title), tolower(q))) %>%
+    pull(row_id)
+  if (!length(hits)) return(tibble(note = "No matching title"))
+  r <- hits[1]
+
+  if (!is.null(sim)) {
+    stopifnot(nrow(sim) == nrow(idx_map), ncol(sim) == nrow(idx_map))
+    s <- sim[r, ]; s[r] <- 0
+    source_used <- "precomputed similarity"
+  } else if (exists("dtm") && exists("row_norms")) {
+    s <- cosine_row(r)
+    source_used <- "DTM on-the-fly cosine"
+  } else {
+    stop("No similarity available. Provide data/content_similarity.rds OR artifacts/content_dtm_model.rds.")
+  }
+
+  ord <- order(s, decreasing = TRUE)
+  tibble(row_id = ord, similarity = s[ord]) %>%
+    left_join(idx_map, by = "row_id") %>%
+    slice_head(n = k) %>%
+    select(title, year, genres, movieId, similarity) %>%
+    mutate(.source = source_used)
+}
+```
+
+### Run summary + Top-10 (reuses results)
+```{r}
+seed <- "Toy Story"; K <- 10
+tim <- system.time({ top10 <- recommend_by_title(seed, K) })
+path_used <- if (!"note" %in% names(top10)) unique(top10$.source) else "N/A"
+
+cat(sprintf(
+"- **Query:** %s  \n- **Top-K:** %d  \n- **Source:** %s  \n- **Elapsed:** %.3fs (user: %.3fs, system: %.3fs)\n",
+seed, K, path_used, tim['elapsed'], tim['user.self'], tim['sys.self']
+))
+
+```
+
+```{r}
+top10
+
+```
+
+```{r}
+if (!"note" %in% names(top10)) {
+ggplot(top10, aes(x = reorder(title, similarity), y = similarity)) +
+geom_col() + coord_flip() +
+labs(title = paste("Top", nrow(top10), "similar to:", seed),
+x = "Movie", y = "Similarity")
+}
+```
+
+
+###IBCF Model (availability note)
+```{r}
+if (!is.null(ibcf)) {
+cat("IBCF model loaded (models/ibcf_model.rds). Use your user profile matrix to score.\n")
+} else {
+cat("IBCF model not available — run your IBCF notebook if you have ratings.csv.\n")
+}
+
+```
+
+```
+

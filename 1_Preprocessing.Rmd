@@ -1,0 +1,116 @@
+---
+title: "preprocessing & merge"
+output: html_document
+date: "2025-10-17"
+---
+**Goal:** Clean titles/genres, compute ratings & tags (plus optional top genome tag), merge all pieces, and write **data/merged_data_final.csv**.
+
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse); library(data.table); library(stringr); library(data.table)
+dir.create("data", showWarnings = FALSE)
+# REQUIRED (put these in ./data)
+movies  <- fread("data/movies.csv")
+ratings <- if (file.exists("data/ratings.csv")) fread("data/ratings.csv") else NULL
+tags    <- if (file.exists("data/tags.csv"))    fread("data/tags.csv")    else NULL
+links   <- if (file.exists("data/links.csv"))   fread("data/links.csv")   else NULL
+genome_scores <- if (file.exists("data/genome-scores.csv")) fread("data/genome-scores.csv") else NULL
+genome_tags   <- if (file.exists("data/genome-tags.csv"))   fread("data/genome-tags.csv")   else NULL
+```
+
+### Clean movie titles + genres
+```{r}
+movies <- movies %>%
+  mutate(year  = str_extract(title, "\\(\\d{4}\\)") |> str_replace_all("[()]", ""),
+         title = str_trim(str_remove(title, "\\(\\d{4}\\)")),
+         genres = na_if(genres, "(no genres listed)")) %>%
+  mutate(genres = if_else(is.na(genres), "", str_replace_all(genres, "\\|", " ")))
+```
+
+```{r}
+cat("\n── Sample of cleaned movies (title/year/genres) ──\n")
+movies %>%
+select(movieId, title, year, genres) %>%
+slice_head(n = 8) %>%
+knitr::kable()
+
+```
+
+
+
+### Aggregate tags per movie (optional but nice)
+
+```{r}
+movie_tags <- if (!is.null(tags)) {
+  tags %>% group_by(movieId) %>%
+    summarise(all_tags = paste(tag, collapse = " "), .groups="drop")
+} else tibble(movieId = integer(), all_tags = character())
+```
+
+
+### Ratings stats per movie (for later sorting)
+
+```{r}
+movie_stats <- if (!is.null(ratings)) {
+  ratings %>% group_by(movieId) %>%
+    summarise(rating_count = n(), avg_rating = mean(rating), .groups="drop")
+} else tibble(movieId = movies$movieId, rating_count = NA_integer_, avg_rating = NA_real_)
+```
+
+
+### (Optional) most relevant genome tag per movie
+
+```{r}
+top_genome <- NULL
+if (!is.null(genome_scores) && !is.null(genome_tags)) {
+  top_genome <- genome_scores %>%
+    group_by(movieId) %>% slice_max(relevance, n=1, with_ties=FALSE) %>% ungroup() %>%
+    left_join(genome_tags, by="tagId") %>%
+    select(movieId, top_tag = tag, top_relevance = relevance)
+}
+```
+
+```{r}
+
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE)
+
+# Tags summary
+if (!is.null(movie_tags) && nrow(movie_tags) > 0) {
+  cat("\n── Tags summary ──\n")
+  cat(sprintf("Movies with at least one user tag: %s\n", fmt(nrow(movie_tags))))
+}
+
+# Genome-top-tag coverage
+if (!is.null(top_genome)) {
+  cat("\n── Genome-top-tag coverage ──\n")
+  cat(sprintf("Movies with a top genome tag: %s\n", fmt(nrow(top_genome))))
+}
+
+# Ratings summary (for completeness)
+if (!is.null(movie_stats)) {
+  cat("\n── Ratings summary ──\n")
+  cat(sprintf("Movies with ≥1 rating: %s\n", fmt(sum(!is.na(movie_stats$rating_count)))))
+  print(summary(movie_stats$avg_rating))
+}
+
+```
+
+
+### Merge all pieces and save
+
+```{r}
+merged <- movies %>%
+  left_join(movie_stats, by="movieId") %>%
+  left_join(movie_tags, by="movieId") %>%
+  { if (!is.null(links)) left_join(., links, by="movieId") else . } %>%
+  { if (!is.null(top_genome)) left_join(., top_genome, by="movieId") else . }
+
+cat("\n── Merge result ──\n")
+cat(sprintf("merged dims: %s × %s\n", fmt(nrow(merged)), fmt(ncol(merged))))
+
+
+fwrite(merged, "data/merged_data_final.csv")
+cat("wrote data/merged_data_final.csv\n")
+
+```
+

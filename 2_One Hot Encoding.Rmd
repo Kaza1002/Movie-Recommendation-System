@@ -1,0 +1,73 @@
+---
+title: "One-Hot Encoding"
+output: html_document
+date: "2025-10-17"
+---
+**Goal:** one-hot encode genres (and optionally the top genome tag) → **`data/cleaned_data(onehot).csv`**
+
+
+```{r}
+suppressPackageStartupMessages({
+library(tidyverse); library(data.table); library(stringr)
+})
+
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE)
+
+# sanity checks before read
+
+cat("WD:", getwd(), "\n")
+cat("Has file? ", file.exists("data/merged_data_final.csv"), "\n")
+
+stopifnot(file.exists("data/merged_data_final.csv"))
+merged <- data.table::fread("data/merged_data_final.csv")
+
+cat("\n── Merge result ──\n")
+cat(sprintf("merged dims: %s × %s\n", fmt(nrow(merged)), fmt(ncol(merged))), "\n")
+
+```
+
+### One-hot genres
+
+```{r}
+oh <- merged %>%
+  mutate(genres_list = str_split(genres, " +")) %>%
+  select(movieId, title, year, genres_list, avg_rating, rating_count, top_tag)
+
+all_genres <- sort(unique(unlist(oh$genres_list)))
+for (g in all_genres) {
+  oh[[g]] <- as.integer(map_lgl(oh$genres_list, ~ g %in% .x))
+}
+oh$genres_list <- NULL
+
+# (Optional) one-hot on top_tag if present
+if ("top_tag" %in% names(oh)) {
+  top_tags <- unique(na.omit(oh$top_tag))
+  for (tg in top_tags) {
+    nm <- paste0("tag__", gsub("\\s+", "_", tolower(tg)))
+    oh[[nm]] <- as.integer(oh$top_tag == tg)
+  }
+}
+
+fwrite(oh, "data/cleaned_data(onehot).csv")
+cat("Wrote data/cleaned_data(onehot).csv\n")
+
+# minimal, readable output (append after your fwrite)
+tag_cols  <- grep("^tag__", names(oh), value = TRUE)
+base_cols <- c("movieId","title","year","avg_rating","rating_count","top_tag")
+genre_cols <- setdiff(names(oh), c(base_cols, tag_cols))
+
+cat("\n── One-hot summary ──\n")
+cat("Rows:", nrow(oh), " | Cols:", ncol(oh), "\n")
+cat("Genre dummies:", length(genre_cols), " | Tag dummies:", length(tag_cols), "\n")
+
+# small preview with just a few dummy columns
+knitr::kable(
+  dplyr::select(
+    oh, movieId, title, year, avg_rating, rating_count,
+    dplyr::any_of(head(genre_cols, 3)),
+    dplyr::any_of(head(tag_cols, 2))
+  ) |>
+  dplyr::slice_head(n = 8)
+)
+
+```

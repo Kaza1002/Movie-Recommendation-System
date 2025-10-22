@@ -1,0 +1,250 @@
+---
+title: "IBCF Model"
+output: html_document
+date: "2025-10-18"
+---
+**Goal:** Item-Based CF with `recommenderlab` on `ratings.csv`, evaluate Precision@K & Lift, save model → **`models/ibcf_model.rds`**
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(Matrix)
+  library(recommenderlab)
+})
+
+dir.create("models", showWarnings = FALSE)
+ratings <- fread("data/ratings.csv")  # needs userId, movieId, rating
+```
+
+
+### Filter to active users/movies for speed + build matrix
+
+```{r}
+min_user_ratings  <- 20
+min_movie_ratings <- 50
+
+# keep moderately active users/items
+active_users  <- ratings %>% count(userId)  %>% filter(n >= min_user_ratings)  %>% pull(userId)
+popular_items <- ratings %>% count(movieId) %>% filter(n >= min_movie_ratings) %>% pull(movieId)
+
+rat <- ratings %>%
+  filter(userId %in% active_users, movieId %in% popular_items) %>%
+  mutate(userId = factor(userId),
+         movieId = factor(movieId)) %>%
+  select(userId, movieId, rating)
+
+# sparse ratings with dimnames (important for mapping predictions)
+users <- levels(rat$userId); items <- levels(rat$movieId)
+R_mat <- sparseMatrix(
+  i = as.integer(rat$userId),
+  j = as.integer(rat$movieId),
+  x = rat$rating,
+  dims = c(length(users), length(items)),
+  dimnames = list(users, items)
+)
+
+R <- as(R_mat, "realRatingMatrix")
+cat("#users:", nrow(R), " | #items:", ncol(R), "\n")
+```
+
+
+### Train/test split + **UBCF** (fast)
+
+```{r}
+# ==== Lightweight IBCF (binary Jaccard) without recommenderlab ====
+
+library(Matrix)
+library(dplyr)
+
+REL_THRESH   <- 4
+TOP_N_ITEMS  <- 800     # you already capped to ~800 — good
+MIN_USER_RAT <- 10      # drop very sparse users to speed things up
+K_NEIGHBORS  <- 40      # how many neighbors to consider per item
+TOP_N        <- 10      # recommendations per user
+BATCH        <- 1000    # users to evaluate (raise later if fast enough)
+
+# 1) Build sparse ratings matrix with dimnames (from your 'rat')
+users <- levels(rat$userId); items <- levels(rat$movieId)
+R_mat <- sparseMatrix(
+  i = as.integer(rat$userId),
+  j = as.integer(rat$movieId),
+  x = rat$rating,
+  dims = c(length(users), length(items)),
+  dimnames = list(users, items)
+)
+
+# 2) Keep TOP_N_ITEMS most popular items
+item_counts <- colSums(R_mat != 0)
+keep_items  <- order(item_counts, decreasing = TRUE)[seq_len(min(TOP_N_ITEMS, length(item_counts)))]
+R_mat <- R_mat[, keep_items, drop = FALSE]
+
+# 3) Drop users with too few ratings (on this subset)
+user_counts <- rowSums(R_mat != 0)
+keep_users  <- which(user_counts >= MIN_USER_RAT)
+R_mat <- R_mat[keep_users, , drop = FALSE]
+
+cat("#users:", nrow(R_mat), " | #items:", ncol(R_mat), "\n"); gc()
+
+# 4) Binarize (implicit feedback): rating >= REL_THRESH -> 1
+B <- as(R_mat, "dgCMatrix")
+B@x <- as.numeric(B@x >= REL_THRESH)
+B  <- drop0(B)
+
+## ---- FAST PATH: build model + recommend (no heavy eval) ----
+suppressPackageStartupMessages(library(Matrix))
+
+# 0) Tight caps so it finishes quickly
+TOP_N_ITEMS <- min(ncol(R_mat), 500)   # <- tighten if needed
+K_NEIGHBORS <- 40                      # 20–60 is fine
+TOP_N       <- 10
+
+# 1) Keep most popular items (cut the matrix width)
+item_counts <- colSums(R_mat != 0)
+keep_items  <- order(item_counts, decreasing = TRUE)[seq_len(TOP_N_ITEMS)]
+R_small     <- R_mat[, keep_items, drop = FALSE]
+
+# 2) Binarize (implicit like)
+B <- as(R_small, "dgCMatrix"); B@x <- as.numeric(B@x >= 4); B <- drop0(B)
+
+cat(sprintf("Users=%d, Items=%d, NNZ=%d\n", nrow(B), ncol(B), length(B@x)))
+
+# 3) Co-occurrence + Jaccard (sparse, no dense outer())
+C   <- crossprod(B)                    # items x items (sparse)
+deg <- diag(C)
+ij  <- Matrix::summary(C)              # i,j,x = co-occurrence counts
+den <- pmax(deg[ij$i] + deg[ij$j] - ij$x, 1e-9)
+ij$x <- ij$x / den
+S <- sparseMatrix(i = ij$i, j = ij$j, x = ij$x, dims = dim(C))
+diag(S) <- 0
+
+# 4) Keep top-K neighbors sparsely (per column)
+topk_cols <- function(M, k) {
+  if (k >= nrow(M)) return(M)
+  for (j in seq_len(ncol(M))) {
+    a <- M@p[j] + 1; b <- M@p[j + 1]
+    if (b > a) {
+      idx <- a:b
+      if (length(idx) > k) {
+        ord  <- order(M@x[idx], decreasing = TRUE)
+        drop <- idx[-ord[1:k]]
+        M@x[drop] <- 0
+      }
+    }
+  }
+  drop0(M)
+}
+S <- topk_cols(S, K_NEIGHBORS)
+
+# 5) Recommend for ONE user (index in B, not original userId)
+recommend_for_user_idx <- function(u, k = TOP_N) {
+  liked <- which(B[u, ] != 0)
+  if (!length(liked)) return(integer(0))
+  scores <- as.numeric(S[, liked, drop = FALSE] %*% rep(1, length(liked)))
+  scores[liked] <- -Inf
+  head(order(scores, decreasing = TRUE), k)
+}
+
+# 6) Helper to map back to original movieId (if you need it)
+item_index_to_movieId <- function(idx) as.integer(colnames(R_small)[idx])
+
+# ---- EXAMPLE: pick a user with at least a few likes
+u <- which(rowSums(B != 0) >= 5)[1]
+recs_idx <- recommend_for_user_idx(u, TOP_N)
+cat("Example user =", u, "→ recommended item indices:", recs_idx, "\n")
+cat("MovieIDs:", item_index_to_movieId(recs_idx), "\n")
+
+# 7) Save the lightweight model
+model <- list(similarity = S,
+              item_labels = colnames(R_small),
+              method = "IBCF_Jaccard_sparse_topK")
+saveRDS(model, "models/ibcf_model.rds")
+cat("✅ Saved models/ibcf_model.rds\n")
+
+```
+
+```{r}
+library(data.table); library(dplyr); library(stringr)
+
+# load movie metadata (adjust path/columns to your file)
+movies <- fread("data/movies.csv")  # needs at least movieId,title (and optionally genres)
+
+# 1) Recommend by ORIGINAL userId (not row index)
+recommend_for_user_id <- function(user_id, k = TOP_N) {
+  # rownames(R_small) should be the original userId levels as character
+  u <- match(as.character(user_id), rownames(R_small))
+  if (is.na(u)) return(tibble(note = sprintf("userId %s not in matrix", user_id)))
+  liked <- which(B[u, ] != 0)  # or B_tr[u, ] if you did splits
+  if (!length(liked)) return(tibble(note = "No likes for this user"))
+  scores <- as.numeric(S[, liked, drop = FALSE] %*% rep(1, length(liked)))
+  scores[liked] <- -Inf
+  rec_idx <- head(order(scores, decreasing = TRUE), k)
+  tibble(
+    item_idx = rec_idx,
+    movieId  = as.integer(colnames(R_small)[rec_idx])
+  ) %>%
+    left_join(movies, by = "movieId")
+}
+
+# 2) If you only have the item indices already:
+pretty_from_indices <- function(rec_idx) {
+  tibble(
+    item_idx = rec_idx,
+    movieId  = as.integer(colnames(R_small)[rec_idx])
+  ) %>% left_join(movies, by = "movieId")
+}
+
+
+# ---- Quick evaluation: Precision@K and Lift (fast) ----
+set.seed(2)
+eval_users <- sample(which(rowSums(B != 0) >= 5), min(200, sum(rowSums(B != 0) >= 5)))
+p_at_k <- function(p, t, k=TOP_N) if (!length(p)||!length(t)) 0 else length(intersect(p[1:k],t))/k
+
+prec <- vapply(eval_users, function(u){
+  liked <- which(B[u, ] != 0)
+  if (length(liked) < 4) return(NA_real_)
+  test  <- sample(liked, max(1, floor(0.2*length(liked))))
+  train <- setdiff(liked, test)
+  scores <- as.numeric(S[, train, drop=FALSE] %*% rep(1, length(train)))
+  scores[train] <- -Inf
+  recs <- head(order(scores, decreasing=TRUE), TOP_N)
+  p_at_k(recs, test, TOP_N)
+}, numeric(1))
+
+mean_precision <- mean(prec, na.rm=TRUE)
+
+# random baseline
+n_items <- ncol(B)
+rand_prec <- vapply(eval_users, function(u){
+  liked <- which(B[u, ] != 0)
+  if (length(liked) < 4) return(NA_real_)
+  test  <- sample(liked, max(1, floor(0.2*length(liked))))
+  recs  <- sample.int(n_items, TOP_N)
+  p_at_k(recs, test, TOP_N)
+}, numeric(1))
+
+lift <- (mean_precision + 1e-9) / (mean(rand_prec, na.rm=TRUE) + 1e-9)
+
+cat(sprintf("Precision@%d = %.3f | Lift = %.2fx | Users=%d\n",
+            TOP_N, mean_precision, lift, sum(!is.na(prec))))
+
+
+
+# EXAMPLES
+# from your example indices:
+recs_idx <- c(10,14,40,18,5,60,2,56,1,69)
+pretty_from_indices(recs_idx)
+
+# for a specific original userId, e.g., 123
+recommend_for_user_id(123, k = 10)
+
+```
+
+```{r}
+### print the model path
+cat("Model saved to: models/ibcf_model.rds\n")
+```
+
